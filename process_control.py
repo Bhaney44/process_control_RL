@@ -1,27 +1,45 @@
 # Standard Imports
-import sys, os
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
 import numpy as np
 from copy import deepcopy
 
+# Custom Learning Modules
+from continuous_policy_gradient_methods import normal_policy_actor_critic
+
 # Define a default response function
-def linear_output_response(pv, out, slope = 0.01):
-    return pv + slope * (out - 50) + np.random.normal(0, 0.05)
+# Variance in slope, output, and random acceptable
+def linear_output_response(pv, out, slope = 0.001):
+    return pv + slope * (out - 50) #+ np.random.normal(0, 0.05)
 
 # Class RL Controller
 class rl_controller():
 
     # Initialize Simulation
-    def __init__(self, pv0=0, sps=np.ones(2000), pvf=linear_output_response, ql=500):
+    def __init__(self, lr=1e-8, df=0.85, 
+                 pv0=0, out0=50, sps=np.ones(2000), pvf=linear_output_response, 
+                 rwd_baseline=10, max_err=0.01, max_err_rwd=100, 
+                 eql=11, sl=10, ql=500):
         
         # Create a Process object and store initial settings
-        self.process = process(pv0, sps, pvf)
+        self.process = process(pv0=pv0, out0=out0, sp=sps, pvf=pvf)
         self.pv0 = pv0
+        self.out0 = out0
         self.sps = sps
         self.pvf = pvf
+        self.rwd_baseline = rwd_baseline
+        self.max_err = max_err
+        self.max_err_rwd = max_err_rwd
+
+        # Create Learning Objects
+        self.policy_gradients = normal_policy_actor_critic(lr, df, eql, sl)
+        self.state = np.zeros(sl).tolist()
+        self.state_length = sl
+        self.reward = 0
+        self.last_action = 0
+        self.prev_last_action = 0
 
         # Screen Dimention Parameters
+        # Parameter variance acceptable
         self.w = 800
         self.h = 600
         self.plot_w = 650
@@ -29,6 +47,7 @@ class rl_controller():
         self.axis_w = 620
         self.axis_h = 360
         self.tickmark_spacing = 100
+        self.queue_offset = 40
 
         # Position Variables
         self.scale_min = -10
@@ -42,15 +61,15 @@ class rl_controller():
         self.queue_length = ql
         self.simulation_length = sps.size
         self.displayed_time = np.arange(ql)
-        self.x_positions = ((self.axis_w/ql) * (np.arange(ql))) + (self.w - self.axis_w)/2
+        self.x_positions = ((self.axis_w/(ql+self.queue_offset)) * (np.arange(ql+self.queue_offset))) + (self.w - self.axis_w)/2
         
         # Episode Variables
         self.episode_complete = False
         self.episode_counter = 0
-        self.total_errors = []
+        self.training_counter = 0
 
     # Pygame Function to Display Visual Simulations
-    def run_sim(self):
+    def run(self, обучение=True):
 
         # Initialize game
         pygame.init()
@@ -60,6 +79,8 @@ class rl_controller():
         # Setup fonts
         title_font = pygame.font.Font(pygame.font.get_default_font(), 26)
         std_font = pygame.font.Font(pygame.font.get_default_font(), 18)
+        mini_font = pygame.font.Font(pygame.font.get_default_font(), 12)
+        fonts = [title_font, std_font, mini_font]
         
         # Start the game loop
         run = True
@@ -67,22 +88,15 @@ class rl_controller():
 
             # Refresh window
             pygame.time.delay(10)
-            
-            # Process Reset
-            if self.process.current_time == self.simulation_length:
-                self.process = process(self.pv0, self.sps, self.pvf)
-                self.queue_position = 0
-                self.displayed_time = np.arange(self.queue_length)
 
-            # Simulate Controller
-            err = self.process.error[len(self.process.error) - 1]
-            out = self.process.out[len(self.process.out) - 1] - 0.002*err**5 - 0.005*err**4 - 0.01*err**3 - 0.123*err
-            self.process.run(out)
+            # Run simulation
+            self.simulate(обучение)
+            if(len(self.process.out) == 0): continue
 
             # Draw Objects
             self.draw_window(window)
-            self.draw_process(window)
-            self.draw_axes_and_text(window, [title_font, std_font])
+            self.draw_process(window, fonts)
+            self.draw_axes_and_text(window, fonts)
 
             # Update Display
             pygame.display.update()
@@ -95,45 +109,121 @@ class rl_controller():
         # End the Game
         pygame.quit()
 
+    def train(self, iterations):
+        
+        # Train for iterations
+        while self.training_counter < iterations: self.simulate()
+        self.training_counter = 0
+
+    def explore(self, iterations, exp_factor=0.01):
+        
+        # Explore for iterations
+        while self.training_counter < iterations: self.simulate(exp_factor=0.01)
+        self.training_counter = 0
+
+    def simulate(self, exp_factor=-1, обучение=True):
+        
+            # Set Variance to Minimum if Learning is Disabled
+            if not обучение: self.policy_gradients.var = self.policy_gradients.variance_annealing_min
+        
+            # Simulate Controller
+            if exp_factor > 0: 
+                pv = self.process.pv[len(self.process.pv)-1]
+                sp = self.process.sp[len(self.process.pv)-1]
+                self.last_action = self.last_action + exp_factor*(sp - pv)
+            else: 
+                self.act()
+
+            # Compute error and append the process
+            pv, sp = self.process.run(self.last_action)
+            
+            # Process Reset
+            if self.process.current_time == self.simulation_length:
+                self.process = process(pv0=self.process.pv[len(self.process.pv) - 1], out0=self.process.out[len(self.process.out) - 1], sp=self.sps, pvf=self.pvf)
+                self.queue_position = 0
+                self.displayed_time = np.arange(self.queue_length)
+                self.episode_complete = True
+                self.episode_counter = self.episode_counter + 1
+                self.training_counter = self.training_counter + 1
+                print("Completed episodes: " + str(self.episode_counter))
+            
+            # Learn via policy gradient if Learning is Enabled
+            if обучение: self.обучение(pv, sp)
+
+    def act(self):
+
+        # Take an action based on the REINFORCE method policy
+        self.prev_last_action = self.last_action
+        self.last_action = self.policy_gradients.act(self.state, self.last_action)
+        if self.last_action > 100: self.last_action = 100
+        if self.last_action < 0: self.last_action = 0
+
+
+    def обучение(self, pv, sp):
+
+        # Append the Error to the state queue and pop the trailing value
+        self.state.append(pv - sp)
+        while len(self.state) > self.state_length: self.state.pop(0)
+
+        # Reward is computed based on spec limits and additional bonuses for tight control
+        self.reward = self.rwd_baseline - np.sum(np.abs(self.state))
+        if np.abs(pv - sp) < self.max_err: self.reward = self.reward + self.max_err_rwd
+        
+        # Pass Reward information to the learning function
+        state = deepcopy(self.state)
+        self.policy_gradients.обучение(state, self.episode_complete, self.reward, self.last_action)
+        if self.episode_complete: self.episode_complete = False
+
     def draw_window(self, window):
 
         # Draw Frame
         pygame.draw.rect(window, (230, 230, 230), (0, 0, self.w, self.h))
         pygame.draw.rect(window, (0, 0, 0), ((self.w - self.plot_w)/2 - 10, (self.h - self.plot_h)/2 - 10, self.plot_w + 20, self.plot_h + 20))
         pygame.draw.rect(window, (255, 255, 255), ((self.w - self.plot_w)/2, (self.h - self.plot_h)/2, self.plot_w, self.plot_h))
-        
-    def draw_process(self, window):
-        
+    
+    #Draw function
+    def draw_process(self, window, fonts):
         # Rescale the output
         min_value = min(min(self.process.pv), min(self.process.sp))
         max_value = max(max(self.process.pv), max(self.process.sp))
         range_value = max_value - min_value
+        # Output scale
         self.scale_min = min_value - 0.1*range_value
         self.scale_max = max_value + 0.1*range_value
-
+        # If statement que position, time, and display
         if self.process.current_time > self.queue_length: 
             self.queue_position = self.process.current_time - self.queue_length
             self.displayed_time = np.arange(self.queue_position, self.queue_position + self.queue_length)
-        
+        # Process variables
         pv = self.process.pv[self.queue_position:(len(self.process.pv))]
-        sp = self.process.sp[self.queue_position:(self.queue_position + self.queue_length)]
+        sp = self.process.sp[self.queue_position:(len(self.process.pv))]
         out = self.process.out[self.queue_position:(len(self.process.out))]
-        
+        # Scale variables
         pv_rescaled = (np.ones(len(pv)) * (self.h - self.axis_h)/2) + ((((np.ones(len(pv)) * self.scale_max) - np.array(pv))/(self.scale_max - self.scale_min)) * (self.axis_h))
         sp_rescaled = (np.ones(len(sp)) * (self.h - self.axis_h)/2) + ((((np.ones(len(sp)) * self.scale_max) - np.array(sp))/(self.scale_max - self.scale_min)) * (self.axis_h))
-        out_rescaled = (np.ones(len(out)) * (self.h - self.axis_h)/2) + (np.array(out)/100 * self.axis_h)
-
+        out_rescaled = (np.ones(len(out)) * (self.h - self.axis_h)/2) + ((1 - np.array(out)/100) * self.axis_h)
+        #Drawline 0
         for idx in np.arange(0, pv_rescaled.size - 1):
             pygame.draw.line(window, (10, 230, 10), (self.x_positions[idx], pv_rescaled[idx]), (self.x_positions[idx + 1], pv_rescaled[idx + 1]), 3)
+        #Drawline 1
         for idx in np.arange(0, sp_rescaled.size - 1):
             pygame.draw.line(window, (230, 10, 10), (self.x_positions[idx], sp_rescaled[idx]), (self.x_positions[idx + 1], sp_rescaled[idx + 1]), 3)
+        #Drawline 2
         for idx in np.arange(0, out_rescaled.size - 1):
             pygame.draw.line(window, (10, 10, 230), (self.x_positions[idx], out_rescaled[idx]), (self.x_positions[idx + 1], out_rescaled[idx + 1]), 3)
+        #Text
+        pv_txt = fonts[2].render(str(round(pv[pv_rescaled.size - 1],3)), True, (10, 230, 10))
+        window.blit(pv_txt, dest=(self.x_positions[pv_rescaled.size - 2] + 10, pv_rescaled[pv_rescaled.size - 2] - 6))
+        sp_txt = fonts[2].render(str(round(sp[sp_rescaled.size - 1],3)), True, (230, 10, 10))
+        window.blit(sp_txt, dest=(self.x_positions[sp_rescaled.size - 2] + 10, sp_rescaled[sp_rescaled.size - 2] - 6))
+        out_txt = fonts[2].render(str(round(out[out_rescaled.size - 1],3)), True, (10, 10, 230))
+        window.blit(out_txt, dest=(self.x_positions[out_rescaled.size - 2] + 10, out_rescaled[out_rescaled.size - 2] - 6))
 
     def draw_axes_and_text(self, window, fonts):
 
         # Draw Simulation Title Text
-        title_txt = fonts[0].render("Process Control with Reinforcement Learning v0.0.1", True, (0, 0, 0))
+        # Drone control using reinforcement learning
+        title_txt = fonts[0].render("B-Control using Reinforcement Learning v0.0.4", True, (0, 0, 0))
         window.blit(title_txt, dest=((self.w - self.plot_w)/2, (self.h - self.plot_h)/2 - 60))
         
         # Draw Vertical Axis
@@ -166,31 +256,46 @@ class rl_controller():
                     tickmark_txt = fonts[1].render(str(val), True, (0, 0, 0))
                     window.blit(tickmark_txt, dest=(xpos, self.scale_zero_position + 10))
 
+        # Draw Simulation Details Text
+        rwd_txt = fonts[1].render("Current Reward: " + str(self.reward), True, (0, 0, 0))
+        window.blit(rwd_txt, dest=((self.w - self.plot_w)/2 + 10, self.h - (self.h - self.plot_h)/2 + 30))
+        la_txt = fonts[1].render("Last Action: " + str(self.last_action), True, (0, 0, 0))
+        window.blit(la_txt, dest=((self.w - self.plot_w)/2 + 10, self.h - (self.h - self.plot_h)/2 + 60))
 
+
+#Process class
 class process():
-
-    def __init__(self, pv0=0, sp=np.ones(2000), pvf=linear_output_response):
+    
+    #Initialize function
+    def __init__(self, pv0=0, out0=50, sp=np.ones(2000), pvf=linear_output_response, max_dout=0.001):
         
         # Specified Parameters
         self.sp = sp
         self.pv_funct = pvf
+        self.max_dout = max_dout
 
         # Init Queues
         self.current_time = 1
         self.pv = [pv0]
-        self.error = [pv0 - sp[0]]
-        self.out = [50]
+        self.out = [out0]
+        
+        # Init Stored Values
+        self.prev_out = 0
 
+    #Run function
     def run(self, o):
 
-        # Truncate output to applicable range and update queue
-        if o > 100: o = 100
-        if o < 0: o = 0
+        # Append Output
         self.out.append(o)
 
         # Calculate PV and Error, and update their queues
-        pv = self.pv_funct(self.pv[len(self.pv) - 1], o)
+        last_pv = self.pv[len(self.pv) - 1]
+        pv = self.pv_funct(last_pv, o)
         sp = self.sp[self.current_time]
+
+        # Update Queues
         self.pv.append(pv)
-        self.error.append(pv - sp)
         self.current_time = self.current_time + 1
+
+        # Return Error
+        return pv, sp
